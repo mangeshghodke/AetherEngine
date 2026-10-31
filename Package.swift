@@ -5,7 +5,11 @@ import PackageDescription
 let package = Package(
     name: "AetherEngine",
     platforms: [
-        .iOS(.v18),
+        // DreamPlayer fork: 7.0.0 raised the floor to iOS 18 only to silence
+        // Swift 6 diagnostics on AVSampleBufferDisplayLayer; no symbol in the
+        // package needs 18 (zero #available(iOS 18) checks exist). iOS 17 is
+        // the app's deployment target.
+        .iOS(.v17),
         .tvOS(.v18),
         .macOS(.v15),
         .visionOS(.v1),

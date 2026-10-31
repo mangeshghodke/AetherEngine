@@ -1,7 +1,8 @@
 import Foundation
 
 /// AE#923: how a host asks the engine to shape decoded audio before it reaches the output: a ceiling
-/// on the channel count, a lift for the dialogue, and dynamic-range compression ("night mode").
+/// on the channel count, a lift for the dialogue, a lift for the bass, and dynamic-range
+/// compression ("night mode").
 ///
 /// The default value shapes nothing, and a session whose shaping is inactive is byte-for-byte the
 /// session it was before this existed: stream copy stays stream copy. Shaping needs PCM, so while it
@@ -11,8 +12,9 @@ import Foundation
 /// says whether a session is actually carrying it.
 ///
 /// The channel work is a remix matrix handed to libswresample (`AudioShapingMatrix`); the stereo
-/// dialogue lift and the dynamics are libavfilter's `dialoguenhance`, `acompressor` and `alimiter`
-/// (`AudioShapingGraph`).
+/// dialogue lift and the dynamics are libavfilter's `dialoguenhance`, `acompressor` and `alimiter`,
+/// and the bass lift is libavfilter's `bass` coefficient formula run directly on the frame — all
+/// three in `AudioShapingGraph` (this FFmpeg build has no `bass` filter to put in a chain).
 public struct AudioShaping: Sendable, Equatable, Hashable {
 
     /// Upper bound on the channels the session outputs; nil keeps the source's (today's behaviour).
@@ -30,15 +32,32 @@ public struct AudioShaping: Sendable, Equatable, Hashable {
     /// Dynamic-range compression; nil is off.
     public var compressor: Compressor?
 
-    public init(maxChannels: Int? = nil, dialogueGainDB: Double = 0, compressor: Compressor? = nil) {
+    /// Bass lift: a low shelf at `bassFrequencyHz`, in dB, clamped to 0...`maxBassGainDB`; 0 is off.
+    /// The coefficients are libavfilter's `bass` (`LowShelfBiquad` in `AudioShapingGraph`), applied
+    /// to the frame before the filter chain, so the compressor and the limiter both see the lifted
+    /// signal and — unlike the dialogue lift — it is plain tone shaping with no latency, on any
+    /// channel count.
+    public var bassGainDB: Double
+
+    /// Corner frequency of that shelf, in Hz, clamped to 20...300.
+    public var bassFrequencyHz: Double
+
+    public init(maxChannels: Int? = nil, dialogueGainDB: Double = 0, compressor: Compressor? = nil,
+                bassGainDB: Double = 0, bassFrequencyHz: Double = 100) {
         self.maxChannels = maxChannels
         self.dialogueGainDB = dialogueGainDB
         self.compressor = compressor
+        self.bassGainDB = bassGainDB
+        self.bassFrequencyHz = bassFrequencyHz
     }
 
     /// The largest dialogue lift the engine applies. Past it a centre channel stops sounding raised
     /// and starts sounding like a separate speaker.
     public static let maxDialogueGainDB: Double = 12
+
+    /// The largest bass lift the engine applies. Past it the shelf starts pushing the mix into the
+    /// limiter rather than adding weight.
+    public static let maxBassGainDB: Double = 12
 
     /// A feed-forward compressor with a soft knee (libavfilter's `acompressor`, peak detection),
     /// linked across every channel so the stereo image and the surround field do not move when one
@@ -96,14 +115,16 @@ public struct AudioShaping: Sendable, Equatable, Hashable {
     public var clamped: AudioShaping {
         AudioShaping(maxChannels: maxChannels.map { min(max($0, 1), 8) },
                      dialogueGainDB: Compressor.clamp(dialogueGainDB, 0, Self.maxDialogueGainDB, fallback: 0),
-                     compressor: compressor?.clamped)
+                     compressor: compressor?.clamped,
+                     bassGainDB: Compressor.clamp(bassGainDB, 0, Self.maxBassGainDB, fallback: 0),
+                     bassFrequencyHz: Compressor.clamp(bassFrequencyHz, 20, 300, fallback: 100))
     }
 
     /// Whether this value asks for anything at all. An inactive value leaves every route as it was.
     /// A cap of 8 is no cap: nothing the engine carries has more.
     public var isActive: Bool {
         let c = clamped
-        return (c.maxChannels ?? 8) < 8 || c.dialogueGainDB > 0 || c.compressor != nil
+        return (c.maxChannels ?? 8) < 8 || c.dialogueGainDB > 0 || c.compressor != nil || c.bassGainDB > 0
     }
 
     /// The channel count a source of `sourceChannels` is shaped into. Never above the source.
@@ -122,6 +143,7 @@ public struct AudioShaping: Sendable, Equatable, Hashable {
         var parts: [String] = []
         if let cap = c.maxChannels { parts.append("max \(cap) ch") }
         if c.dialogueGainDB > 0 { parts.append(String(format: "dialogue %+.1f dB", c.dialogueGainDB)) }
+        if c.bassGainDB > 0 { parts.append(String(format: "bass %+.1f dB @ %.0f Hz", c.bassGainDB, c.bassFrequencyHz)) }
         if let k = c.compressor {
             parts.append(String(format: "compressor %.0f dB %.1f:1 makeup %+.1f dB", k.thresholdDB, k.ratio, k.makeupGainDB))
         }

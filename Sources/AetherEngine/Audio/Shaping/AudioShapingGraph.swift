@@ -11,6 +11,11 @@ import AetherLibavutil
 ///   the dialogue into a third channel and `pan` folds it back onto both sides at the asked gain.
 ///   Measured against a mid/side lift on a stereo mix of centred speech and wide music, it separates
 ///   the speech 3 to 5 dB further from the wide content.
+/// - the low shelf (`bassGainDB`), applied to the frame in `push()` before it enters the graph:
+///   the coefficient formula of libavfilter's `bass`, which this FFmpeg build does not compile in
+///   (see `LowShelfBiquad` at the end of this file). It sits ahead of the dialogue fold, the
+///   compressor and the limiter, so the dynamics and the ceiling both see the lifted signal; IIR,
+///   so no latency and no pts work; on mono, stereo, 5.1 and 7.1 alike.
 /// - `acompressor` for night mode.
 /// - `alimiter` at `ceilingDBFS` whenever shaping is active, with lookahead and its own latency
 ///   compensation: measured against an instant-attack limiter, its splatter above 3 kHz on a
@@ -37,6 +42,11 @@ final class AudioShapingGraph {
     /// Only the format pin, for when the full chain cannot be rebuilt: the owner's swresample
     /// output format is chosen for this graph, so the audio still has to come out through one.
     private let passthroughChain: String
+    /// The bass lift as a pre-graph biquad; nil while `bassGainDB` is 0.
+    private var shelf: LowShelfBiquad?
+    /// Whether the graph currently built carries `alimiter`. The shelf only applies behind it: a
+    /// boost with no ceiling could clip, and `reset()`'s passthrough fallback has no limiter.
+    private var limiterInGraph = false
     private let sampleRate: Int32
     private let channels: Int32
     private let layoutDescription: String
@@ -115,8 +125,12 @@ final class AudioShapingGraph {
         self.channels = layout.pointee.nb_channels
         self.layoutDescription = layoutDescription
         self.latency = enhance ? Self.dialogueEnhanceLatency(sampleRate: sampleRate) : 0
+        self.shelf = LowShelfBiquad(gainDB: shaping.clamped.bassGainDB,
+                                    frequency: shaping.clamped.bassFrequencyHz,
+                                    sampleRate: sampleRate,
+                                    channels: Int(layout.pointee.nb_channels))
         av_channel_layout_copy(&inputLayout, layout)
-        guard build(chain, latency: latency) else {
+        guard build(chain, latency: latency, limiterInGraph: true) else {
             free()
             return nil
         }
@@ -133,7 +147,7 @@ final class AudioShapingGraph {
         sink = nil
     }
 
-    private func build(_ chain: String, latency: Int) -> Bool {
+    private func build(_ chain: String, latency: Int, limiterInGraph: Bool) -> Bool {
         free()
         guard let g = avfilter_graph_alloc(),
               let abuffer = avfilter_get_by_name("abuffer"),
@@ -160,14 +174,16 @@ final class AudioShapingGraph {
         trimRemaining = latency
         ended = false
         pending.removeAll(keepingCapacity: true)
+        self.limiterInGraph = limiterInGraph
+        shelf?.reset()
         return true
     }
 
     /// Drop everything in flight, for a seek or a restart: the filters keep history (the limiter's
     /// lookahead, the compressor's envelope, the enhancer's window) that belongs to the old position.
     func reset() {
-        guard !build(chain, latency: latency) else { return }
-        if build(passthroughChain, latency: 0) {
+        guard !build(chain, latency: latency, limiterInGraph: true) else { return }
+        if build(passthroughChain, latency: 0, limiterInGraph: false) {
             EngineLog.emit("[AudioShaping] filter graph could not be rebuilt; audio passes unshaped", category: .session)
         } else {
             free()
@@ -209,6 +225,9 @@ final class AudioShapingGraph {
         guard av_channel_layout_copy(&frame.pointee.ch_layout, &inputLayout) >= 0 else { return }
         guard av_frame_get_buffer(frame, 0) >= 0, let dst = frame.pointee.data.0 else { return }
         memcpy(dst, samples, frames * Int(channels) * MemoryLayout<Float>.size)
+        if limiterInGraph {
+            shelf?.apply(dst.assumingMemoryBound(to: Float.self), frames: frames)
+        }
         frame.pointee.pts = inputSamples
         inputSamples += Int64(frames)
         let ret = av_buffersrc_add_frame_flags(source, frame, 0)
@@ -263,5 +282,73 @@ final class AudioShapingGraph {
             }
         }
         return pts
+    }
+}
+
+/// The bass lift as a low-shelf biquad: libavfilter's `bass` coefficient formula applied here,
+/// on the frame, because the FFmpeg this engine links is built from an allow-list that does not
+/// compile `bass` (or any EQ) in — a chain stage for it would simply never load.
+///
+/// The coefficients are `af_biquads.c` `case bass:` (`poles == 2`) verbatim: `A = 10^(gain/40)`,
+/// `alpha = sin(w0)/(2Q)` with Q = 0.5 (the filter's default `width` for `width_type=q`), and
+/// `beta = sqrt(2A)` — the `bass`-specific override of the generic shelf's `2*sqrt(A)`, and what
+/// makes it a hi-fi tone control rather than the textbook RBJ shelf. Checked against a real
+/// `ffmpeg -af bass=...` across 5 Hz..8 kHz, gains 4/7/10 dB, f0 100/180 Hz: worst gain
+/// difference 0.006 dB. Gain is the lift at 0 Hz, the same reference libavfilter documents.
+///
+/// Transposed direct form II, one state pair per channel, applied in place to interleaved Float32
+/// as `push()` copies a frame in: sample-in equals sample-out, so no latency, no pts work, and the
+/// limiter still sees the lifted signal as its last stage. Not thread safe; the owner serialises
+/// every call under its own lock, like the rest of the graph.
+private struct LowShelfBiquad {
+    private let b0, b1, b2, a1, a2: Float
+    private let channels: Int
+    private var z1: [Float]
+    private var z2: [Float]
+
+    /// nil when the lift is off, or when the parameters cannot describe a stable shelf.
+    init?(gainDB: Double, frequency: Double, sampleRate: Int32, channels: Int) {
+        guard gainDB > 0, channels > 0, sampleRate > 0 else { return nil }
+        let A = pow(10.0, gainDB / 40.0)
+        let w0 = 2.0 * Double.pi * frequency / Double(sampleRate)
+        guard w0 > 0, w0 < Double.pi else { return nil }
+        let alpha = sin(w0)                    // sin(w0)/(2Q), Q = 0.5
+        let beta = sqrt(2.0 * A)               // `case bass:` override, not 2*sqrt(A)
+        let c = cos(w0)
+        let ba = beta * alpha
+        let a0 = (A + 1) + (A - 1) * c + ba
+        guard a0.isFinite, a0 != 0 else { return nil }
+        b0 = Float(A * ((A + 1) - (A - 1) * c + ba) / a0)
+        b1 = Float(2 * A * ((A - 1) - (A + 1) * c) / a0)
+        b2 = Float(A * ((A + 1) - (A - 1) * c - ba) / a0)
+        a1 = Float(-2 * ((A - 1) + (A + 1) * c) / a0)
+        a2 = Float(((A + 1) + (A - 1) * c - ba) / a0)
+        self.channels = channels
+        z1 = [Float](repeating: 0, count: channels)
+        z2 = [Float](repeating: 0, count: channels)
+    }
+
+    /// Drops the filter's history, for a seek: it belongs to the old position.
+    mutating func reset() {
+        for i in z1.indices { z1[i] = 0; z2[i] = 0 }
+    }
+
+    /// Applies the shelf in place to `frames` frames of interleaved Float32.
+    mutating func apply(_ samples: UnsafeMutablePointer<Float>, frames: Int) {
+        guard frames > 0 else { return }
+        for ch in 0..<channels {
+            var s1 = z1[ch], s2 = z2[ch]
+            var i = ch
+            for _ in 0..<frames {
+                let x = samples[i]
+                let y = b0 * x + s1
+                s1 = b1 * x - a1 * y + s2
+                s2 = b2 * x - a2 * y
+                samples[i] = y
+                i += channels
+            }
+            z1[ch] = s1
+            z2[ch] = s2
+        }
     }
 }
