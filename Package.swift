@@ -5,11 +5,13 @@ import PackageDescription
 let package = Package(
     name: "AetherEngine",
     platforms: [
-        // DreamPlayer fork: 7.0.0 raised the floor to iOS 18 only to silence
-        // Swift 6 diagnostics on AVSampleBufferDisplayLayer; no symbol in the
-        // package needs 18 (zero #available(iOS 18) checks exist). iOS 17 is
-        // the app's deployment target.
-        .iOS(.v17),
+        // Upstream's floor, kept as is. A DreamPlayer attempt to lower this to
+        // iOS 17 failed to compile: the 7.x line uses iOS 17.2 / 17.4 / 18
+        // APIs UNCONDITIONALLY (AVAudioSession rendering-mode notifications,
+        // AVSampleBufferDisplayLayer.isReadyForDisplay / displayedPixelBuffer
+        // / loadVideoPerformanceMetrics, Task.detached(executorPreference:)),
+        // so the app's deployment target has to follow the package's.
+        .iOS(.v18),
         .tvOS(.v18),
         .macOS(.v15),
         .visionOS(.v1),

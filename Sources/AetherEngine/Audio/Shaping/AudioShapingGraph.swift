@@ -226,7 +226,7 @@ final class AudioShapingGraph {
         guard av_frame_get_buffer(frame, 0) >= 0, let dst = frame.pointee.data.0 else { return }
         memcpy(dst, samples, frames * Int(channels) * MemoryLayout<Float>.size)
         if limiterInGraph {
-            shelf?.apply(dst.assumingMemoryBound(to: Float.self), frames: frames)
+            shelf?.apply(UnsafeMutableRawPointer(dst).assumingMemoryBound(to: Float.self), frames: frames)
         }
         frame.pointee.pts = inputSamples
         inputSamples += Int64(frames)
