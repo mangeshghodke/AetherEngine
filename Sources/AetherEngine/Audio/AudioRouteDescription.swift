@@ -76,9 +76,16 @@ enum AudioRouteDescription {
             guard let route = current() else { return }
             EngineLog.emit("[AetherEngine] audioRoute changed reason=\(reason) \(route)", category: .engine)
         }
-        for (name, what) in [(AVAudioSession.renderingModeChangeNotification, "rendering mode"),
-                             (AVAudioSession.renderingCapabilitiesChangeNotification, "rendering capabilities"),
-                             (AVAudioSession.spatialPlaybackCapabilitiesChangedNotification, "spatial playback")] {
+        // renderingModeChangeNotification is iOS 17.2+, renderingCapabilitiesChangeNotification is iOS 16+,
+        // spatialPlaybackCapabilitiesChangedNotification is iOS 15+. Conditionally observe.
+        var notifications: [(NSNotification.Name, String)] = [
+            (AVAudioSession.renderingCapabilitiesChangeNotification, "rendering capabilities"),
+            (AVAudioSession.spatialPlaybackCapabilitiesChangedNotification, "spatial playback"),
+        ]
+        if #available(iOS 17.2, tvOS 17.2, *) {
+            notifications.append((AVAudioSession.renderingModeChangeNotification, "rendering mode"))
+        }
+        for (name, what) in notifications {
             _ = NotificationCenter.default.addObserver(forName: name, object: session, queue: nil) { _ in
                 guard let route = current() else { return }
                 EngineLog.emit("[AetherEngine] audioRoute \(what) changed \(route)", category: .engine)

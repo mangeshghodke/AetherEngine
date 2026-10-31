@@ -5,13 +5,11 @@ import PackageDescription
 let package = Package(
     name: "AetherEngine",
     platforms: [
-        // Upstream's floor, kept as is. A DreamPlayer attempt to lower this to
-        // iOS 17 failed to compile: the 7.x line uses iOS 17.2 / 17.4 / 18
-        // APIs UNCONDITIONALLY (AVAudioSession rendering-mode notifications,
-        // AVSampleBufferDisplayLayer.isReadyForDisplay / displayedPixelBuffer
-        // / loadVideoPerformanceMetrics, Task.detached(executorPreference:)),
-        // so the app's deployment target has to follow the package's.
-        .iOS(.v18),
+        // DreamPlayer: iOS 17 floor with guarded 17.2/17.4 APIs.
+        // renderingModeChangeNotification (17.2) and loadVideoPerformanceMetrics (17.4)
+        // are wrapped in #available checks. The 18 APIs (Task.detached executorPreference,
+        // asUnownedTaskExecutor) are already guarded with #available(visionOS 2, *).
+        .iOS(.v17),
         .tvOS(.v18),
         .macOS(.v15),
         .visionOS(.v1),
