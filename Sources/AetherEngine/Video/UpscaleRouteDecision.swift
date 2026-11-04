@@ -65,7 +65,9 @@ enum UpscaleRouteDecision: Equatable {
         guard isSDR, !isDolbyVision else { return .notTaken(.hdrOrDolbyVision) }
         guard isEightBit420 else { return .notTaken(.notEightBit420) }
         guard source.width > 0, source.height > 0 else { return .notTaken(.geometryUnknown) }
-        guard source.width < 1920, source.height < 1080 else { return .notTaken(.notBelow1080p) }
+        // DreamPlayer fork: SD / 720p / 1080p are all eligible, so the classifier is the
+        // smaller dimension at <= 1080 (1080p is exactly 1920x1080; 4K is 2160 tall).
+        guard Swift.min(source.width, source.height) <= 1080 else { return .notTaken(.notBelow1080p) }
         guard let plan = makePlan(source: source, display: display, mlScaleFactors: mlScaleFactors),
               plan.targetWidth > source.width || plan.targetHeight > source.height
         else { return .notTaken(.displayNotLarger) }
@@ -177,7 +179,7 @@ extension UpscaleRouteDecision.Reason {
         case .hdrOrDolbyVision: return "HDR or Dolby Vision source"
         case .notEightBit420: return "source is not 8-bit 4:2:0"
         case .geometryUnknown: return "source size unknown"
-        case .notBelow1080p: return "source is not below 1080p"
+        case .notBelow1080p: return "source is above 1080p (SD/720p/1080p only)"
         case .displayNotLarger: return "display is not larger than the source"
         case .airPlayVideoReceiver: return "AirPlay video receiver"
         case .demuxedAudioLive: return "live stream with demuxed audio"
